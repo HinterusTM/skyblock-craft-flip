@@ -21,12 +21,14 @@ Die fertige `Skyblock-Flip.exe` gibt es unter [Releases](../../releases/latest).
 | Profit | VK − AH-Steuer − EK (Order) |
 | Fill-Zeit | Geschätzte Zeit, bis die Buy Order voll ist, wenn du oben im Orderbuch stehst (Insta-Sell-Volumen der letzten 7 Tage) |
 
-Standardmäßig werden alle 32 Dragon-Armor-Teile verglichen. Im Feld **Items** kannst du beliebige craftbare Item-IDs eingeben (z.B. `WISE_DRAGON_BOOTS, SUPERIOR_DRAGON_LEGGINGS`). Klick auf eine Zeile zeigt Zutaten, Preise und Konkurrenz im Orderbuch.
+Geprüft werden **alle craftbaren Items**, die gerade im Auction House angeboten werden und deren Zutaten einen Preis haben (Bazaar oder AH), aktuell gut 600 Stück. Das Feld **Suche** filtert nach Name oder ID (mehrere mit Komma, z.B. `dragon, hyperion`). **Sichere Preise** (standardmäßig an) blendet Items mit weniger als 3 BIN-Angeboten oder über 1000 % Marge aus (meist Troll-Listings). Ein Klick auf eine Zeile zeigt Zutaten, Preise, Konkurrenz im Orderbuch und nötige Collections.
+
+> Sehr hohe Margen sind oft kein echter Flip: Das Rezept braucht eine Collection bzw. Freischaltung, oder eine Zutat hat einen Wert, den der Lowest BIN nicht abbildet (z.B. Midas Sword). Solche Zeilen werden in den Details markiert.
 
 ## Datenquellen
 
 - Preise: [Hypixel API](https://api.hypixel.net/) (`/v2/skyblock/bazaar` und `/v2/skyblock/auctions`, öffentlich, kein Key)
-- Rezepte: [NotEnoughUpdates-REPO](https://github.com/NotEnoughUpdates/NotEnoughUpdates-REPO)
+- Rezepte: [NotEnoughUpdates-REPO](https://github.com/NotEnoughUpdates/NotEnoughUpdates-REPO), einmal am Tag geladen und unter `%LOCALAPPDATA%\SkyblockCraftFlip` gecacht
 
 ## Aus dem Code starten
 
@@ -34,7 +36,7 @@ Nur Python 3 nötig, keine Pakete:
 
 ```bash
 python skyblock_flip.py                              # GUI
-python skyblock_flip.py --cli                        # Tabelle in der Konsole
+python skyblock_flip.py --cli                        # Top 40 über alle Items in der Konsole
 python skyblock_flip.py --cli WISE_DRAGON_BOOTS      # bestimmte Items
 ```
 

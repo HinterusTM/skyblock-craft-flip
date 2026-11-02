@@ -2,33 +2,38 @@
 Hypixel Skyblock Craft-Flip Rechner
 
 Vergleicht: Zutaten per Bazaar-Buy-Order kaufen -> Item craften -> im Auction House (BIN) verkaufen.
-Rezepte kommen automatisch aus dem NotEnoughUpdates-Repo, Preise live aus der Hypixel API (kein Key noetig).
+Rezepte kommen aus dem NotEnoughUpdates-Repo (einmal am Tag geladen und lokal gecacht),
+Preise live aus der Hypixel API (kein Key noetig). Geprueft werden alle craftbaren Items im Auction House.
 
 Benutzung:
     python skyblock_flip.py                                # GUI (oder Doppelklick)
-    python skyblock_flip.py --cli                          # Konsole, alle Dragon-Armor-Teile
+    python skyblock_flip.py --cli                          # Konsole, Top 40 ueber alle Items
     python skyblock_flip.py --cli WISE_DRAGON_BOOTS ...    # Konsole, beliebige Item-IDs
 
 Exe bauen: build.bat
 """
 
 import base64
+import collections
 import gzip
 import json
+import io
 import os
 import re
 import statistics
 import sys
 import time
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 API = "https://api.hypixel.net/v2/skyblock"
-NEU = "https://raw.githubusercontent.com/NotEnoughUpdates/NotEnoughUpdates-REPO/master/items/{}.json"
-
-DRAGONS = ["WISE", "STRONG", "SUPERIOR", "YOUNG", "OLD", "PROTECTOR", "UNSTABLE", "HOLY"]
-PIECES = ["HELMET", "CHESTPLATE", "LEGGINGS", "BOOTS"]
-DEFAULT_ITEMS = [f"{d}_DRAGON_{p}" for d in DRAGONS for p in PIECES]
+NEU_ZIP = "https://github.com/NotEnoughUpdates/NotEnoughUpdates-REPO/archive/refs/heads/master.zip"
+CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "SkyblockCraftFlip", "recipes.json")
+SLOTS = [row + col for row in "ABC" for col in "123"]
+COLOR_CODE = re.compile("§.|[-]")  # Farbcodes wie "§6" und Hypixel-Icon-Glyphen aus Namen
+MIN_BINS = 3  # "Sichere Preise": genug BIN-Angebote ...
+MAX_MARGIN = 1000  # ... und keine absurde Marge (meist Troll-Listings oder gesperrte Rezepte)
 
 EXPLANATION = ("Profit = VK - AH-Steuer - EK (Order). Fill-Zeit = geschaetzte Zeit bis die Buy Order voll ist,\n"
                "wenn du ganz oben im Orderbuch stehst (basiert auf Insta-Sell-Volumen der letzten 7 Tage).")
@@ -40,20 +45,50 @@ def get_json(url):
         return json.load(r)
 
 
-def fetch_recipe(item_id):
-    """Zutaten als {ITEM_ID: Anzahl}, oder None wenn kein Crafting-Rezept."""
+def download_recipes():
+    """Alle Crafting-Rezepte aus dem NotEnoughUpdates-Repo (ein ZIP, ~20 MB)."""
+    req = urllib.request.Request(NEU_ZIP, headers={"User-Agent": "skyblock-flip"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        data = r.read()
+    recipes = {}
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for name in z.namelist():
+            if "/items/" not in name or not name.endswith(".json"):
+                continue
+            item = json.loads(z.read(name))
+            recipe = item.get("recipe") or next(
+                (r for r in item.get("recipes", []) if r.get("type") == "crafting"), None)
+            if not recipe:
+                continue
+            ingredients = {}
+            for slot in SLOTS:
+                if recipe.get(slot):
+                    ing, _, count = recipe[slot].partition(":")
+                    ingredients[ing] = ingredients.get(ing, 0) + int(float(count or 1))
+            if ingredients:
+                recipes[item["internalname"]] = dict(
+                    ingredients=ingredients, count=int(recipe.get("count") or 1),
+                    name=COLOR_CODE.sub("", item.get("displayname", "")).strip(), req=item.get("crafttext", ""))
+    return recipes
+
+
+def load_recipes(max_age=24 * 3600):
+    """Rezepte aus dem lokalen Cache, einmal am Tag neu laden. Offline: alter Cache."""
     try:
-        recipe = get_json(NEU.format(item_id)).get("recipe")
+        if time.time() - os.path.getmtime(CACHE) < max_age:
+            with open(CACHE, encoding="utf-8") as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    try:
+        recipes = download_recipes()
     except Exception:
-        return None
-    if not recipe:
-        return None
-    ingredients = {}
-    for slot in recipe.values():
-        if slot:
-            name, _, count = slot.partition(":")
-            ingredients[name] = ingredients.get(name, 0) + int(count or 1)
-    return ingredients
+        with open(CACHE, encoding="utf-8") as f:
+            return json.load(f)
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    with open(CACHE, "w", encoding="utf-8") as f:
+        json.dump(recipes, f)
+    return recipes
 
 
 ID_TAG = re.compile(rb"\x08\x00\x02id")  # NBT TAG_String "id" = ExtraAttributes.id
@@ -68,8 +103,8 @@ def item_id_from_bytes(item_bytes):
     return raw[m.end() + 2:m.end() + 2 + n].decode("utf-8", "replace")
 
 
-def fetch_lowest_bins(wanted):
-    """{ITEM_ID: (niedrigster BIN, Anzahl BIN-Angebote)} fuer alle IDs in wanted."""
+def fetch_lowest_bins():
+    """{ITEM_ID: (niedrigster BIN, Anzahl BIN-Angebote)} fuer alles im Auction House."""
     first = get_json(f"{API}/auctions?page=0")
     with ThreadPoolExecutor(16) as ex:
         pages = [first] + list(ex.map(lambda p: get_json(f"{API}/auctions?page={p}"),
@@ -80,7 +115,7 @@ def fetch_lowest_bins(wanted):
             if not a.get("bin"):
                 continue
             iid = item_id_from_bytes(a["item_bytes"])
-            if iid in wanted:
+            if iid:
                 low, count = result.get(iid, (float("inf"), 0))
                 result[iid] = (min(low, a["starting_bid"]), count + 1)
     return result
@@ -109,6 +144,8 @@ def signed(n):
 def fmt_hours(h):
     if h is None:
         return "-"
+    if h == float("inf"):
+        return "nie"
     if h < 1:
         return f"{h * 60:.0f} min"
     if h < 48:
@@ -116,40 +153,54 @@ def fmt_hours(h):
     return f"{h / 24:.1f} Tage"
 
 
+def reliable(row):
+    return row["listings"] >= MIN_BINS and (row["margin"] is None or row["margin"] <= MAX_MARGIN)
+
+
 def pretty(item_id):
     return item_id.replace("_", " ").title()
 
 
 def ingredient_line(i):
-    line = f"{i['qty']}x {pretty(i['id'])} @ {fmt(i['price'])} ({i['source']})"
+    line = f"{i['qty']}x {i['name']} @ {fmt(i['price'])} ({i['source']})"
     if i["per_hour"] is not None:
         line += (f" | {fmt(i['per_hour'])}/h Insta-Sells, {fmt(i['competing'])} Stk. "
                  f"in {i['orders']} konkurrierenden Buy Orders")
     return line
 
 
-def analyze(targets):
-    """Gibt (rows, warnings) zurueck, rows nach Profit sortiert."""
-    with ThreadPoolExecutor(16) as ex:
-        recipes = dict(zip(targets, ex.map(fetch_recipe, targets)))
-        bazaar_job = ex.submit(get_json, f"{API}/bazaar")
-    bazaar = bazaar_job.result()["products"]
-    warnings = [f"Kein Crafting-Rezept fuer {t}" for t in targets if not recipes[t]]
-    recipes = {k: v for k, v in recipes.items() if v}
+def analyze(targets=None):
+    """Gibt (rows, warnings) zurueck, rows nach Profit sortiert.
 
-    # Zutaten, die nicht im Bazaar sind, werden ueber AH-Lowest-BIN bepreist
-    ah_ingredients = {i for r in recipes.values() for i in r if i not in bazaar}
-    bins = fetch_lowest_bins(set(recipes) | ah_ingredients)
+    targets=None: alle craftbaren Items, die gerade im Auction House angeboten werden und
+    deren Zutaten alle einen Preis haben (Bazaar oder AH)."""
+    with ThreadPoolExecutor(2) as ex:
+        recipes_job = ex.submit(load_recipes)
+        bazaar_job = ex.submit(get_json, f"{API}/bazaar")
+        bins = fetch_lowest_bins()
+    recipes, bazaar = recipes_job.result(), bazaar_job.result()["products"]
+
+    if targets:
+        warnings = [f"Kein Crafting-Rezept fuer {t}" for t in targets if t not in recipes]
+        items = [t for t in targets if t in recipes]
+    else:
+        warnings = []
+        items = [i for i in recipes if i in bins]
+
+    def name(item_id):
+        return recipes[item_id]["name"] if item_id in recipes and recipes[item_id]["name"] else pretty(item_id)
 
     rows = []
-    for item, recipe in recipes.items():
+    for item in items:
+        recipe = recipes[item]
         cost_order = cost_insta = 0.0
-        fill_hours = 0.0
+        fill_hours = None  # bleibt None, wenn keine Zutat aus dem Bazaar kommt
         missing = []
         ingredients = []
-        for ing, qty in recipe.items():
-            if ing in bazaar:
-                q = bazaar[ing]
+        for ing, qty in recipe["ingredients"].items():
+            bz = ing.replace("-", ":")  # NEU "INK_SACK-3" = Bazaar "INK_SACK:3"
+            if bz in bazaar:
+                q = bazaar[bz]
                 orders = q["sell_summary"]  # = offene Buy Orders
                 sells = q["buy_summary"]  # = offene Sell Offers
                 order_price = orders[0]["pricePerUnit"] + 0.1 if orders else q["quick_status"]["sellPrice"]
@@ -157,10 +208,10 @@ def analyze(targets):
                 # Buy Orders werden durch Insta-Sells gefuellt -> sellMovingWeek
                 per_hour = q["quick_status"]["sellMovingWeek"] / 168
                 hours = qty / per_hour if per_hour else float("inf")
-                fill_hours = max(fill_hours, hours)
+                fill_hours = max(fill_hours or 0.0, hours)
                 cost_order += order_price * qty
                 cost_insta += insta_price * qty
-                ingredients.append(dict(id=ing, qty=qty, price=order_price, source="Buy Order",
+                ingredients.append(dict(id=ing, name=name(ing), qty=qty, price=order_price, source="Buy Order",
                                         per_hour=per_hour, hours=hours,
                                         competing=q["quick_status"]["sellVolume"],
                                         orders=q["quick_status"]["sellOrders"]))
@@ -168,16 +219,28 @@ def analyze(targets):
                 price = bins[ing][0]
                 cost_order += price * qty
                 cost_insta += price * qty
-                ingredients.append(dict(id=ing, qty=qty, price=price, source="AH BIN", per_hour=None))
+                ingredients.append(dict(id=ing, name=name(ing), qty=qty, price=price, source="AH BIN", per_hour=None))
             else:
-                missing.append(ing)
+                missing.append(name(ing))
+        if (missing or not cost_order) and not targets:
+            continue  # im Alle-Items-Modus nur Rezepte, die komplett (und nicht mit 0) bepreist werden koennen
 
+        # Manche Rezepte ergeben mehrere Stueck: Kosten pro Stueck rechnen
+        cost_order /= recipe["count"]
+        cost_insta /= recipe["count"]
         sell, listings = bins.get(item, (None, 0))
         tax = ah_tax(sell) if sell else None
         profit = sell - tax - cost_order if sell and not missing else None
         margin = profit / cost_order * 100 if profit is not None and cost_order else None
-        rows.append(dict(item=item, cost=cost_order, insta=cost_insta, sell=sell, listings=listings, tax=tax,
+        rows.append(dict(item=item, name=name(item), req=recipe["req"], count=recipe["count"],
+                         cost=cost_order, insta=cost_insta, sell=sell, listings=listings, tax=tax,
                          profit=profit, margin=margin, fill=fill_hours, missing=missing, ingredients=ingredients))
+
+    # Gleiche Anzeigenamen (z.B. 15 Varianten "Inferno Minion Fuel") ueber die ID unterscheidbar machen
+    name_count = collections.Counter(r["name"] for r in rows)
+    for r in rows:
+        if name_count[r["name"]] > 1:
+            r["name"] += f" ({pretty(r['item'])})"
 
     rows.sort(key=lambda r: r["profit"] if r["profit"] is not None else float("-inf"), reverse=True)
     return rows, warnings
@@ -188,19 +251,21 @@ def run_cli(targets):
     rows, warnings = analyze(targets)
     for w in warnings:
         print(f"  ! {w}")
+    if not targets:  # Alle Items: nur verlaessliche Preise, Top 40
+        rows = [r for r in rows if reliable(r)][:40]
 
     print()
-    header = f"{'Item':<28}{'EK (Order)':>12}{'EK (Insta)':>12}{'VK (BIN)':>11}{'BINs':>6}{'Profit':>11}{'Marge':>8}{'Fill-Zeit':>12}"
+    header = f"{'Item':<34}{'EK (Order)':>12}{'EK (Insta)':>12}{'VK (BIN)':>11}{'BINs':>6}{'Profit':>11}{'Marge':>8}{'Fill-Zeit':>12}"
     print(header)
     print("-" * len(header))
     for r in rows:
         margin = f"{r['margin']:.0f}%" if r["margin"] is not None else "-"
-        print(f"{r['item']:<28}{fmt(r['cost']):>12}{fmt(r['insta']):>12}{fmt(r['sell']):>11}"
+        print(f"{r['name'][:33]:<34}{fmt(r['cost']):>12}{fmt(r['insta']):>12}{fmt(r['sell']):>11}"
               f"{r['listings']:>6}{fmt(r['profit']):>11}{margin:>8}{fmt_hours(r['fill']):>12}")
 
     print("\nDetails (Top 5):")
     for r in rows[:5]:
-        print(f"  {r['item']}")
+        print(f"  {r['name']}" + (f"  ({r['req']})" if r["req"] else ""))
         for i in r["ingredients"]:
             print(f"    {ingredient_line(i)}")
         if r["missing"]:
@@ -535,26 +600,28 @@ def run_gui():
     # ---------- Toolbar ----------
     toolbar = tk.Frame(root, bg=C["bg"])
     toolbar.pack(fill="x", padx=px(24), pady=(px(14), px(10)))
-    label(toolbar, "ITEMS", (CAPS, 9)).pack(side="left")
+    label(toolbar, "SUCHE", (CAPS, 9)).pack(side="left")
     entry_panel = PixelPanel(toolbar)
     entry_panel.pack(side="left", padx=(px(12), px(12)))
-    items_var = tk.StringVar()
-    entry = tk.Entry(entry_panel.inner, textvariable=items_var, width=34, font=(MONO, 16), bg=C["panel"],
+    search_var = tk.StringVar()
+    entry = tk.Entry(entry_panel.inner, textvariable=search_var, width=30, font=(MONO, 16), bg=C["panel"],
                      fg=C["text"], insertbackground=C["accent"], relief="flat", bd=0,
                      selectbackground=C["accent"], selectforeground=C["white"])
     entry.pack(padx=px(4), pady=px(1))
     entry.bind("<FocusIn>", lambda e: entry_panel.set_outline(C["accent"]))
     entry.bind("<FocusOut>", lambda e: entry_panel.set_outline(C["border"]))
-    label(toolbar, "leer = alle Dragon Armor  /  z.B. WISE_DRAGON_BOOTS, ...", (MONO, 15), fg="muted").pack(side="left")
+    label(toolbar, "Name oder ID, mehrere mit Komma  /  z.B. dragon, hyperion", (MONO, 15), fg="muted").pack(side="left")
     auto_var = tk.BooleanVar()
     only_profit_var = tk.BooleanVar()
+    min_bins_var = tk.BooleanVar(value=True)
     PixelCheck(toolbar, "AUTO-REFRESH 5 MIN", auto_var).pack(side="right")
     PixelCheck(toolbar, "NUR PROFITABLE", only_profit_var, command=lambda: render()).pack(side="right", padx=px(22))
+    PixelCheck(toolbar, "SICHERE PREISE", min_bins_var, command=lambda: render()).pack(side="right")
 
     # ---------- Tabelle ----------
     # (Key, Ueberschrift, Breite, Ausrichtung, Formatierer)
     columns = [
-        ("item", "ITEM", 250, "w", pretty),
+        ("name", "ITEM", 290, "w", str),
         ("cost", "EK (ORDER)", 110, "e", fmt),
         ("insta", "EK (INSTA)", 110, "e", fmt),
         ("sell", "VK (BIN)", 105, "e", fmt),
@@ -577,7 +644,7 @@ def run_gui():
 
     # ---------- Details ----------
     details_panel = PixelPanel(root)
-    details = tk.Text(details_panel.inner, height=4, bg=C["panel"], fg=C["text"], font=(MONO, 15), relief="flat",
+    details = tk.Text(details_panel.inner, height=6, bg=C["panel"], fg=C["text"], font=(MONO, 15), relief="flat",
                       highlightthickness=0, bd=0, padx=px(8), pady=px(4), wrap="word", cursor="arrow",
                       state="disabled", selectbackground=C["accent"])
     details.pack(fill="x")
@@ -610,6 +677,13 @@ def run_gui():
     def render():
         col, desc = state["sort"]
         rows = state["rows"]
+        terms = [t.strip().lower() for t in search_var.get().split(",") if t.strip()]
+        if terms:
+            rows = [r for r in rows if any(t in r["name"].lower() or t.replace(" ", "_") in r["item"].lower()
+                                           for t in terms)]
+        if min_bins_var.get():
+            rows = [r for r in rows if reliable(r)]
+        update_cards(rows)
         if only_profit_var.get():
             rows = [r for r in rows if r["profit"] is not None and r["profit"] > 0]
         # None-Werte (kein Preis) immer ans Ende
@@ -621,6 +695,7 @@ def run_gui():
         for i, r in enumerate(rows):
             tags = (profit_tag(r["profit"]),) + (("odd",) if i % 2 else ())
             tree.insert("", "end", iid=str(i), values=[f(r[k]) for k, _, _, _, f in columns], tags=tags)
+        tree.yview_moveto(0)
         for k, title, *_ in columns:
             arrow = ("  ▼" if desc else "  ▲") if k == col else ""
             tree.heading(k, text=title + arrow)
@@ -628,7 +703,7 @@ def run_gui():
 
     def sort_by(col):
         current, desc = state["sort"]
-        state["sort"] = (col, not desc) if col == current else (col, col != "item")
+        state["sort"] = (col, not desc) if col == current else (col, col != "name")
         render()
 
     for key, title, width, anchor, _ in columns:
@@ -640,7 +715,10 @@ def run_gui():
         if not selection:
             return
         r = state["shown"][int(selection[0])]
-        parts = [(pretty(r["item"]) + "\n", "title")]
+        parts = [(r["name"], "title")]
+        if r["req"]:
+            parts.append((f"   {r['req']}", "yellow"))
+        parts.append(("\n", None))
         for caption, value, tag in [("Einkauf (Order)", fmt(r["cost"]), None),
                                     ("Einkauf (Insta)", fmt(r["insta"]), None),
                                     ("Verkauf (BIN)", fmt(r["sell"]), None),
@@ -648,38 +726,43 @@ def run_gui():
                                     ("Profit", signed(r["profit"]), TEXT_COLOR[profit_tag(r["profit"])])]:
             parts += [(caption + "  ", "muted"), (value, tag or "bold"), ("      ", None)]
         parts.append(("\n", None))
+        if r["count"] > 1:
+            parts.append((f"Rezept ergibt {r['count']} Stueck, Preise oben pro Stueck. Zutaten pro Craft:\n", "muted"))
         for i in r["ingredients"]:
-            parts.append((f"{i['qty']}x {pretty(i['id'])}", "accent"))
+            parts.append((f"{i['qty']}x {i['name']}", "accent"))
             parts.append((f"   {fmt(i['price'])}/Stk. via {i['source']}", "muted"))
             if i["per_hour"] is not None:
                 parts.append((f"  /  {fmt(i['per_hour'])}/h Insta-Sells  /  {fmt(i['competing'])} Stk. in "
                               f"{i['orders']} konkurrierenden Buy Orders  /  Fill ~{fmt_hours(i['hours'])}", "muted"))
             parts.append(("\n", None))
         for m in r["missing"]:
-            parts.append((f"[!] Kein Preis fuer {pretty(m)}\n", "yellow"))
+            parts.append((f"[!] Kein Preis fuer {m}\n", "yellow"))
         if r["sell"] is None:
             parts.append(("[!] Gerade kein BIN-Angebot im Auction House\n", "yellow"))
         elif r["listings"] < 5:
             parts.append((f"[!] Nur {r['listings']} BIN-Angebote - Verkaufspreis unsicher\n", "yellow"))
+        if r["margin"] is not None and r["margin"] > 200:
+            parts.append(("[!] Sehr hohe Marge: pruefen, ob das Rezept eine Collection/Freischaltung braucht "
+                          "oder der AH-Preis nur von wenigen Angeboten kommt\n", "yellow"))
         write_details(parts)
 
-    def update_cards(warnings):
-        rows = state["rows"]
+    def update_cards(rows):
+        """Karten fuer die aktuell gefilterten Zeilen (Suche, Min. BINs)."""
         profitable = [r for r in rows if r["profit"] is not None and r["profit"] > 0]
         if profitable:
-            best = profitable[0]  # rows sind nach Profit sortiert
+            best = max(profitable, key=lambda r: r["profit"])
             best_value.configure(text=signed(best["profit"]), fg=C["green"])
-            best_sub.configure(text=pretty(best["item"]))
-            margin_value.configure(text=f"{statistics.median(r['margin'] for r in profitable):.0f}%")
+            best_sub.configure(text=best["name"])
+            margins = [r["margin"] for r in profitable if r["margin"] is not None]
+            margin_value.configure(text=f"{statistics.median(margins):.0f}%" if margins else "-")
             margin_sub.configure(text="ueber alle profitablen Items")
         else:
             best_value.configure(text="-", fg=C["white"])
-            best_sub.configure(text="Gerade kein profitabler Flip")
+            best_sub.configure(text="Gerade kein profitabler Flip" if state["rows"] else " ")
             margin_value.configure(text="-")
             margin_sub.configure(text=" ")
         count_value.configure(text=f"{len(profitable)} / {len(rows)}")
-        count_sub.configure(text=f"{len(warnings)} Items ohne Rezept" if warnings else "Items mit Gewinn")
-        time_value.configure(text=time.strftime("%H:%M:%S"))
+        count_sub.configure(text="Items mit Gewinn")
 
     def update_auto_label(*_):
         time_sub.configure(text="Auto-Refresh alle 5 min" if auto_var.get() else "Auto-Refresh aus")
@@ -698,22 +781,20 @@ def run_gui():
         if error:
             status_label.configure(text=f"Fehler: {error}", fg=C["red"])
             return
-        rows, warnings = result
-        state["rows"] = rows
+        state["rows"] = result[0]
         render()
-        update_cards(warnings)
-        status_label.configure(text=f"{len(rows)} Items geladen", fg=C["muted"])
+        time_value.configure(text=time.strftime("%H:%M:%S"))
+        status_label.configure(text=f"{len(state['rows'])} craftbare Items im AH", fg=C["muted"])
 
     def refresh(_event=None):
         if state["loading"]:
             return
         set_loading(True)
-        targets = [t.upper() for t in items_var.get().replace(",", " ").split()] or DEFAULT_ITEMS
         job = {}
 
         def work():
             try:
-                job["result"] = analyze(targets)
+                job["result"] = analyze()
             except Exception as e:
                 job["error"] = e
 
@@ -732,7 +813,7 @@ def run_gui():
             refresh()
         root.after(300_000, auto_tick)
 
-    entry.bind("<Return>", refresh)
+    search_var.trace_add("write", lambda *_: render())
     tree.bind("<<TreeviewSelect>>", show_details)
     auto_var.trace_add("write", update_auto_label)
     update_auto_label()
@@ -745,6 +826,7 @@ def run_gui():
 if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] == "--cli":
-        run_cli([a.upper() for a in args[1:]] or DEFAULT_ITEMS)
+        sys.stdout.reconfigure(errors="replace")  # Windows-Konsole kann nicht jedes Zeichen
+        run_cli([a.upper() for a in args[1:]] or None)
     else:
         run_gui()
